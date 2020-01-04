@@ -1,79 +1,99 @@
+Learn more or give us feedback
 import argparse
+from collections import OrderedDict
 
-import torch
-import numpy as np
 from torch import nn
 from torch import optim
-import torch.nn.functional as F
-from torchvision import datasets, transforms, models
+from torch.optim import lr_scheduler
+from torchvision import models
 
-from util_functions import load_data
-from functions import build_classifier, validation, train_model, test_model, save_model, load_checkpoint
+from utils import get_data_loaders, save_checkpoint
+from .trainer import Trainer
 
-parser = argparse.ArgumentParser(description='Train neural network.')
 
-# ../aipnd-project/flowers
-parser.add_argument('data_directory', action = 'store',
-                    help = 'Enter path to training data.')
+def main():
+    args = get_input_args()
+    model = build_model(args.arch, int(args.hidden_units))
+    image_datasets, data_loaders = get_data_loaders(args.data_path)
 
-parser.add_argument('--arch', action='store',
-                    dest = 'pretrained_model', default = 'vgg11',
-                    help= 'Enter pretrained model to use; this classifier can currently work with\
-                           VGG and Densenet architectures. The default is VGG-11.'
+    # Hyperparameters
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.classifier.parameters(), lr=float(args.lr))
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
 
-parser.add_argument('--save_dir', action = 'store',
-                    dest = 'save_directory', default = 'checkpoint.pth',
-                    help = 'Enter location to save checkpoint in.')
+    trainer = Trainer(scheduler, optimizer, criterion)
+    # Print stats every epoch
+    trainer.debug = True
 
-parser.add_argument('--learning_rate', action = 'store',
-                    dest = 'lr', type=int, default = 0.001,
-                    help = 'Enter learning rate for training the model, default is 0.001.')
+    # Moves parameters and buffers to the GPU
+    if args.gpu:
+        model = model.cuda()
 
-parser.add_argument('--dropout', action = 'store',
-                    dest='drpt', type=int, default = 0.05,
-                    help = 'Enter dropout for training the model, default is 0.05.')
+    for epoch in range(args.epochs):
+        trainer.train(model, data_loaders['train'], len(image_datasets['train']))
+        trainer.validate(model, data_loaders['val'], len(image_datasets['val']))
 
-parser.add_argument('--hidden_units', action = 'store',
-                    dest = 'units', type=int, default = 500,
-                    help = 'Enter number of hidden units in classifier, default is 500.')
+    save_checkpoint(model, optimizer, data_loaders['train'], args.save_dir)
 
-parser.add_argument('--epochs', action = 'store',
-                    dest = 'num_epochs', type = int, default = 2,
-                    help = 'Enter number of epochs to use during training, default is 1.')
 
-parser.add_argument('--gpu', action = "store_true", default = False,
-                    help = 'Turn GPU mode on or off, default is off.')
+def get_input_args():
+    """
+    Parse command line arguments
+    :returns: Argument object
+    """
+    parser = argparse.ArgumentParser()
 
-results = parser.parse_args()
+    parser.add_argument('data_path', action="store")
+    parser.add_argument("--save_dir", default=".",
+                        help="Checkpoint directory path")
+    parser.add_argument("--arch", default="vgg13", help="Model architecture")
+    parser.add_argument("--learning_rate", default=0.001, help="Learning rate",
+                        action="store", dest="lr", )
+    parser.add_argument("--hidden_units", default=512,
+                        help="Number of hidden units")
+    parser.add_argument("--epochs", default=5, help="Number of epochs")
+    parser.add_argument("--gpu", default=False,
+                        help="Use GPU for training", action='store_true')
 
-data_dir = results.data_directory
-save_dir = results.save_directory
-learning_rate = results.lr
-dropout = results.drpt
-hidden_units = results.units
-epochs = results.num_epochs
-gpu_mode = results.gpu
+    return parser.parse_args()
 
-# Load and preprocess data
-trainloader, testloader, validloader, train_data, test_data, valid_data = load_data(data_dir)
 
-# Load pretrained model
-pre_tr_model = results.pretrained_model
-model = getattr(models,pre_tr_model)(pretrained=True)
+def build_model(model_name, hidden_units):
+    """
+    Create a Torch Vision model. https://pytorch.org/docs/master/torchvision/models.html
+    :param model_name: string
+    :param hidden_units: int
+    :returns: model
+    """
+    try:
+        model = getattr(models, model_name)(pretrained=True)
+    except:
+        raise ValueError('Invalid model name' + model_name)
 
-# Build and attach new classifier
-input_units = model.classifier[0].in_features
-build_classifier(model, input_units, hidden_units, dropout)
+    for param in model.parameters():
+        param.requires_grad = False
 
-# Recommended to use NLLLoss when using Softmax
-criterion = nn.NLLLoss()
-# Using Adam optimiser which makes use of momentum to avoid local minima
-optimizer = optim.Adam(model.classifier.parameters(), learning_rate)
+    model.classifier = create_classifier(
+        model.classifier[0].in_features, hidden_units)
 
-# Train model
-model, optimizer = train_model(model, epochs,trainloader, validloader, criterion, optimizer, gpu_mode)
+    return model
 
-# Test model
-test_model(model, testloader, gpu_mode)
-# Save model
-save_model(loaded_model, train_data, optimizer, save_dir, epochs)
+
+def create_classifier(input_units, hidden_units):
+    """
+    Create a classifier for a model with ReLU activation function,
+    dropout and the specified units.
+    :param input_units: int
+    :param hidden_units: int
+    :returns: Tensor
+    """
+    return nn.Sequential(OrderedDict([
+        ('fc1', nn.Linear(input_units, hidden_units)),
+        ('relu', nn.ReLU()),
+        ('dropout', nn.Dropout(p=0.5)),
+        ('fc2', nn.Linear(hidden_units, 102)),
+        ('output', nn.LogSoftmax(dim=1))
+    ]))
+
+
+main()
