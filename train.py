@@ -1,99 +1,220 @@
-Learn more or give us feedback
-import argparse
-from collections import OrderedDict
-
+#importing necessary libraries
+import matplotlib.pyplot as plt
+import torch
+import numpy as np
 from torch import nn
 from torch import optim
-from torch.optim import lr_scheduler
-from torchvision import models
+from torchvision import datasets, models, transforms
+import torch.nn.functional as F
+import torch.utils.data
+import pandas as pd
+from collections import OrderedDict
+from PIL import Image
+import argparse
+import json
 
-from utils import get_data_loaders, save_checkpoint
-from .trainer import Trainer
+# define Mandatory and Optional Arguments for the script
+parser = argparse.ArgumentParser (description = "Parser of training script")
+
+parser.add_argument ('data_dir', help = 'Provide data directory. Mandatory argument', type = str)
+parser.add_argument ('--save_dir', help = 'Provide saving directory. Optional argument', type = str)
+parser.add_argument ('--arch', help = 'Vgg13 can be used if this argument specified, otherwise Alexnet will be used', type = str)
+parser.add_argument ('--lrn', help = 'Learning rate, default value 0.001', type = float)
+parser.add_argument ('--hidden_units', help = 'Hidden units in Classifier. Default value is 2048', type = int)
+parser.add_argument ('--epochs', help = 'Number of epochs', type = int)
+parser.add_argument ('--GPU', help = "Option to use GPU", type = str)
+
+#setting values data loading
+args = parser.parse_args ()
+
+data_dir = args.data_dir
+train_dir = data_dir + '/train'
+valid_dir = data_dir + '/valid'
+test_dir = data_dir + '/test'
+
+#defining device: either cuda or cpu
+if args.GPU == 'GPU':
+    device = 'cuda'
+else:
+    device = 'cpu'
+
+#data loading
+if data_dir: #making sure we do have value for data_dir
+    # Define your transforms for the training, validation, and testing sets
+    train_data_transforms = transforms.Compose ([transforms.RandomRotation (30),
+                                                transforms.RandomResizedCrop (224),
+                                                transforms.RandomHorizontalFlip (),
+                                                transforms.ToTensor (),
+                                                transforms.Normalize ([0.485, 0.456, 0.406],[0.229, 0.224, 0.225])
+                                                ])
+
+    valid_data_transforms = transforms.Compose ([transforms.Resize (255),
+                                                transforms.CenterCrop (224),
+                                                transforms.ToTensor (),
+                                                transforms.Normalize ([0.485, 0.456, 0.406],[0.229, 0.224, 0.225])
+                                                ])
+
+    test_data_transforms = transforms.Compose ([transforms.Resize (255),
+                                                transforms.CenterCrop (224),
+                                                transforms.ToTensor (),
+                                                transforms.Normalize ([0.485, 0.456, 0.406],[0.229, 0.224, 0.225])
+                                                ])
+    # Load the datasets with ImageFolder
+    train_image_datasets = datasets.ImageFolder (train_dir, transform = train_data_transforms)
+    valid_image_datasets = datasets.ImageFolder (valid_dir, transform = valid_data_transforms)
+    test_image_datasets = datasets.ImageFolder (test_dir, transform = test_data_transforms)
+
+    # Using the image datasets and the trainforms, define the dataloaders
+    train_loader = torch.utils.data.DataLoader(train_image_datasets, batch_size = 64, shuffle = True)
+    valid_loader = torch.utils.data.DataLoader(valid_image_datasets, batch_size = 64, shuffle = True)
+    test_loader = torch.utils.data.DataLoader(test_image_datasets, batch_size = 64, shuffle = True)
+    #end of data loading block
+
+#mapping from category label to category name
+with open('cat_to_name.json', 'r') as f:
+    cat_to_name = json.load(f)
+
+def load_model (arch, hidden_units):
+    if arch == 'vgg13': #setting model based on vgg13
+        model = models.vgg13 (pretrained = True)
+        for param in model.parameters():
+            param.requires_grad = False
+        if hidden_units: #in case hidden_units were given
+            classifier = nn.Sequential  (OrderedDict ([
+                            ('fc1', nn.Linear (25088, 4096)),
+                            ('relu1', nn.ReLU ()),
+                            ('dropout1', nn.Dropout (p = 0.3)),
+                            ('fc2', nn.Linear (4096, hidden_units)),
+                            ('relu2', nn.ReLU ()),
+                            ('dropout2', nn.Dropout (p = 0.3)),
+                            ('fc3', nn.Linear (hidden_units, 102)),
+                            ('output', nn.LogSoftmax (dim =1))
+                            ]))
+        else: #if hidden_units not given
+            classifier = nn.Sequential  (OrderedDict ([
+                        ('fc1', nn.Linear (25088, 4096)),
+                        ('relu1', nn.ReLU ()),
+                        ('dropout1', nn.Dropout (p = 0.3)),
+                        ('fc2', nn.Linear (4096, 2048)),
+                        ('relu2', nn.ReLU ()),
+                        ('dropout2', nn.Dropout (p = 0.3)),
+                        ('fc3', nn.Linear (2048, 102)),
+                        ('output', nn.LogSoftmax (dim =1))
+                        ]))
+    else: #setting model based on default Alexnet ModuleList
+        arch = 'alexnet' #will be used for checkpoint saving, so should be explicitly defined
+        model = models.alexnet (pretrained = True)
+        for param in model.parameters():
+            param.requires_grad = False
+        if hidden_units: #in case hidden_units were given
+            classifier = nn.Sequential  (OrderedDict ([
+                            ('fc1', nn.Linear (9216, 4096)),
+                            ('relu1', nn.ReLU ()),
+                            ('dropout1', nn.Dropout (p = 0.3)),
+                            ('fc2', nn.Linear (4096, hidden_units)),
+                            ('relu2', nn.ReLU ()),
+                            ('dropout2', nn.Dropout (p = 0.3)),
+                            ('fc3', nn.Linear (hidden_units, 102)),
+                            ('output', nn.LogSoftmax (dim =1))
+                            ]))
+        else: #if hidden_units not given
+            classifier = nn.Sequential  (OrderedDict ([
+                        ('fc1', nn.Linear (9216, 4096)),
+                        ('relu1', nn.ReLU ()),
+                        ('dropout1', nn.Dropout (p = 0.3)),
+                        ('fc2', nn.Linear (4096, 2048)),
+                        ('relu2', nn.ReLU ()),
+                        ('dropout2', nn.Dropout (p = 0.3)),
+                        ('fc3', nn.Linear (2048, 102)),
+                        ('output', nn.LogSoftmax (dim =1))
+                        ]))
+    model.classifier = classifier #we can set classifier only once as cluasses self excluding (if/else)
+    return model, arch
+
+# Defining validation Function. will be used during training
+def validation(model, valid_loader, criterion):
+    model.to (device)
+
+    valid_loss = 0
+    accuracy = 0
+    for inputs, labels in valid_loader:
+
+        inputs, labels = inputs.to(device), labels.to(device)
+        output = model.forward(inputs)
+        valid_loss += criterion(output, labels).item()
+
+        ps = torch.exp(output)
+        equality = (labels.data == ps.max(dim=1)[1])
+        accuracy += equality.type(torch.FloatTensor).mean()
+
+    return valid_loss, accuracy
+
+#loading model using above defined functiion
+model, arch = load_model (args.arch, args.hidden_units)
+
+#Actual training of the model
+#initializing criterion and optimizer
+criterion = nn.NLLLoss ()
+if args.lrn: #if learning rate was provided
+    optimizer = optim.Adam (model.classifier.parameters (), lr = args.lrn)
+else:
+    optimizer = optim.Adam (model.classifier.parameters (), lr = 0.001)
 
 
-def main():
-    args = get_input_args()
-    model = build_model(args.arch, int(args.hidden_units))
-    image_datasets, data_loaders = get_data_loaders(args.data_path)
+model.to (device) #device can be either cuda or cpu
+#setting number of epochs to be run
+if args.epochs:
+    epochs = args.epochs
+else:
+    epochs = 7
 
-    # Hyperparameters
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.classifier.parameters(), lr=float(args.lr))
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+print_every = 40
+steps = 0
 
-    trainer = Trainer(scheduler, optimizer, criterion)
-    # Print stats every epoch
-    trainer.debug = True
+#runing through epochs
+for e in range (epochs):
+    running_loss = 0
+    for ii, (inputs, labels) in enumerate (train_loader):
+        steps += 1
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad () #where optimizer is working on classifier paramters only
 
-    # Moves parameters and buffers to the GPU
-    if args.gpu:
-        model = model.cuda()
+        # Forward and backward passes
+        outputs = model.forward (inputs) #calculating output
+        loss = criterion (outputs, labels) #calculating loss (cost function)
+        loss.backward ()
+        optimizer.step () #performs single optimization step
+        running_loss += loss.item () # loss.item () returns scalar value of Loss function
 
-    for epoch in range(args.epochs):
-        trainer.train(model, data_loaders['train'], len(image_datasets['train']))
-        trainer.validate(model, data_loaders['val'], len(image_datasets['val']))
+        if steps % print_every == 0:
+            model.eval () #switching to evaluation mode so that dropout is turned off
+            # Turn off gradients for validation, saves memory and computations
+            with torch.no_grad():
+                valid_loss, accuracy = validation(model, valid_loader, criterion)
 
-    save_checkpoint(model, optimizer, data_loaders['train'], args.save_dir)
+            print("Epoch: {}/{}.. ".format(e+1, epochs),
+                  "Training Loss: {:.3f}.. ".format(running_loss/print_every),
+                  "Valid Loss: {:.3f}.. ".format(valid_loss/len(valid_loader)),
+                  "Valid Accuracy: {:.3f}%".format(accuracy/len(valid_loader)*100))
 
+            running_loss = 0
+            # Make sure training is back on
+            model.train()
 
-def get_input_args():
-    """
-    Parse command line arguments
-    :returns: Argument object
-    """
-    parser = argparse.ArgumentParser()
+#saving trained Model
+model.to ('cpu') #no need to use cuda for saving/loading model.
+# Save the checkpoint
+model.class_to_idx = train_image_datasets.class_to_idx #saving mapping between predicted class and class name,
+#second variable is a class name in numeric
 
-    parser.add_argument('data_path', action="store")
-    parser.add_argument("--save_dir", default=".",
-                        help="Checkpoint directory path")
-    parser.add_argument("--arch", default="vgg13", help="Model architecture")
-    parser.add_argument("--learning_rate", default=0.001, help="Learning rate",
-                        action="store", dest="lr", )
-    parser.add_argument("--hidden_units", default=512,
-                        help="Number of hidden units")
-    parser.add_argument("--epochs", default=5, help="Number of epochs")
-    parser.add_argument("--gpu", default=False,
-                        help="Use GPU for training", action='store_true')
-
-    return parser.parse_args()
-
-
-def build_model(model_name, hidden_units):
-    """
-    Create a Torch Vision model. https://pytorch.org/docs/master/torchvision/models.html
-    :param model_name: string
-    :param hidden_units: int
-    :returns: model
-    """
-    try:
-        model = getattr(models, model_name)(pretrained=True)
-    except:
-        raise ValueError('Invalid model name' + model_name)
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    model.classifier = create_classifier(
-        model.classifier[0].in_features, hidden_units)
-
-    return model
-
-
-def create_classifier(input_units, hidden_units):
-    """
-    Create a classifier for a model with ReLU activation function,
-    dropout and the specified units.
-    :param input_units: int
-    :param hidden_units: int
-    :returns: Tensor
-    """
-    return nn.Sequential(OrderedDict([
-        ('fc1', nn.Linear(input_units, hidden_units)),
-        ('relu', nn.ReLU()),
-        ('dropout', nn.Dropout(p=0.5)),
-        ('fc2', nn.Linear(hidden_units, 102)),
-        ('output', nn.LogSoftmax(dim=1))
-    ]))
-
-
-main()
+#creating dictionary for model saving
+checkpoint = {'classifier': model.classifier,
+              'state_dict': model.state_dict (),
+              'arch': arch,
+              'mapping':    model.class_to_idx
+             }
+#saving trained model for future use
+if args.save_dir:
+    torch.save (checkpoint, args.save_dir + '/checkpoint.pth')
+else:
+    torch.save (checkpoint, 'checkpoint.pth')
